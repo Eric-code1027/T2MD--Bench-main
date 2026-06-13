@@ -1,0 +1,25 @@
+# TMD++ SFT 训练配置(Stage 4.2)
+# 在原 ovi/configs/training/finetune.yaml 基础上,新增 ACE-Step base 相关字段。
+
+# ---- 权重 / 路径 ----
+ckpt_dir: ./ckpts                       # Wan VAE / T5 所在(同 train_t2av)
+video_config: ovi/configs/model/dit/video.json
+video_fusion_ckpt: ./ckpts/Ovi/model.safetensors   # 只取 Wan video DiT 主干权重
+
+# ---- ACE-Step base ----
+acestep_project_root: ./ACE-Step-main   # ACE 仓库根(handler 从这里 import)
+ace_config_path: acestep-v15-base       # base 权重目录(用户指定:最全的一档)
+
+# ---- 训练 ----
+trainable_scope: fusion                 # 只训融合子层(v_fuse / a_fuse)
+learning_rate: 1.0e-5
+num_epochs: 50
+dataset_repeat: 20
+gradient_checkpointing: true
+mixed_precision: bf16
+
+# ---- 过拟合 sanity(先 10 条干净音乐舞蹈样本) ----
+resolution: [480, 480]                  # 过拟合先 480,通过后再上 720
+audio_loss_weight: 0.15
+video_loss_weight: 0.85
+guidance_for_eval: 1.0                  # 过拟合验证关 CFG,排除训推差异
