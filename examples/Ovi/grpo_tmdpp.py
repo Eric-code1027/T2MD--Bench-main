@@ -109,6 +109,9 @@ class TMDppGRPOTrainer(TMDppTrainingModule):
         vid_tgt = self.scheduler.training_target(latent_video, noise_v, timestep)
         aud_t = self.scheduler.add_noise(audio_latent, noise_a, timestep)
         aud_tgt = self.scheduler.training_target(audio_latent, noise_a, timestep)
+        # ACE 时间步 == sigma ∈ [0,1]
+        sigma = self.scheduler.get_sigma_from_timestep(timestep).to(
+            dtype=self.torch_dtype, device=self.device)
 
         # image-ref 首帧 clean(i2v),与 SFT/推理一致
         vid_t[:, :, :1] = latent_video[:, :, :1]
@@ -120,7 +123,7 @@ class TMDppGRPOTrainer(TMDppTrainingModule):
             vid=[vid_t.squeeze(0)], audio_latent=aud_t, t=timestep,
             vid_context=text_emb, ace_encoder_hidden_states=ace_enc,
             ace_encoder_attention_mask=ace_enc_mask, ace_context_latents=ace_ctx,
-            vid_seq_len=seq_len, first_frame_is_clean=True)
+            vid_seq_len=seq_len, ace_timestep=sigma, first_frame_is_clean=True)
 
         w = self.scheduler.training_weight(timestep)
         vp = vid_pred[0] if isinstance(vid_pred, (list, tuple)) else vid_pred
