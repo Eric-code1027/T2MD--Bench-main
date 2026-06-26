@@ -165,24 +165,41 @@ class FusionAceStepLayerwise(nn.Module):
     def forward(self,
                 vid,                         # list[ [C,F,H,W] ]  video latent(已加噪)
                 audio_latent,                # [B, T, 64]         ACE audio latent(已加噪)
-                t,                           # [B]                共用 timestep
+                t,                           # [B]   video 塔 timestep(Wan 单位,0~1000)
                 vid_context,                 # T5 text emb (list)
                 ace_encoder_hidden_states,   # [B, L_enc, 2048]   ACE encoder 输出(text+lyric+timbre)
                 ace_encoder_attention_mask,  # [B, L_enc]
                 ace_context_latents,         # [B, T, 128]
                 vid_seq_len,
+                ace_timestep=None,           # [B]   ACE 塔 timestep == sigma ∈ [0,1](见下方说明)
                 first_frame_is_clean=False,
                 slg_layer=False):
-        """返回 (video_pred [C,F,H,W], audio_pred [B,T,64])。"""
+        """返回 (video_pred [C,F,H,W], audio_pred [B,T,64])。
+
+        ⚠ 时间步单位(关键修复):
+        video 塔(Wan)的 time_embed 吃 0~1000 的 timestep;
+        ACE 塔的 time_embed.scale=1000,内部会再 ×1000,所以**必须**喂 sigma∈[0,1]。
+        两塔 flow-matching 公式一致(xt=(1-σ)·data+σ·noise, target=noise-data),
+        故只需把同一噪声级 σ 以各自单位分别送入:video 用 t(Wan timestep),audio 用 σ。
+        若调用方未显式传 ace_timestep,默认 t 已是 sigma(<=1 时按原样,否则报错防呆)。
+        """
+        if ace_timestep is None:
+            # 防呆:若误把 Wan 的 0~1000 timestep 当 ace_timestep 传进来,直接拦截。
+            if float(t.max()) > 1.0 + 1e-4:
+                raise ValueError(
+                    "ace_timestep 缺失,且 t 看起来是 Wan 0~1000 timestep。"
+                    "请传 ace_timestep=sigma(get_sigma_from_timestep(timestep),∈[0,1])。")
+            ace_timestep = t
 
         # ---- video 进 block 循环前的准备 ----
         vid_x, vid_e, vid_kw = self.video_model.prepare_transformer_block_kwargs(
             x=vid, t=t, context=vid_context, seq_len=vid_seq_len,
             clip_fea=None, y=None, first_frame_is_clean=first_frame_is_clean)
 
-        # ---- audio 进 layer 循环前的准备(timestep_r = t => 退化为标准 flow) ----
+        # ---- audio 进 layer 循环前的准备 ----
+        #  时间步用 sigma(ACE 单位);timestep_r=timestep(use_meanflow=False,r=t)。
         a_hidden, a_state = self.ace.prepare(
-            hidden_states=audio_latent, timestep=t, timestep_r=t,
+            hidden_states=audio_latent, timestep=ace_timestep, timestep_r=ace_timestep,
             encoder_hidden_states=ace_encoder_hidden_states,
             encoder_attention_mask=ace_encoder_attention_mask,
             context_latents=ace_context_latents, attention_mask=None)
