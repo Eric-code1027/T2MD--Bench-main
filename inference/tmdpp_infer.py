@@ -69,6 +69,8 @@ def tmdpp_generate(
 
     for t in tqdm(scheduler.timesteps):
         timestep = torch.full((1,), float(t), device=device, dtype=dtype)
+        # ACE 时间步 == sigma ∈ [0,1](与训练一致;否则音频塔时间嵌入错乱)
+        sigma = scheduler.get_sigma_from_timestep(timestep).to(device=device, dtype=dtype)
         # i2v:每步覆盖首帧(与训练一致)
         vid[:, :1] = ref_latent
 
@@ -78,7 +80,7 @@ def tmdpp_generate(
                 ace_encoder_hidden_states=ace_enc,
                 ace_encoder_attention_mask=ace_enc_mask,
                 ace_context_latents=ace_ctx,
-                vid_seq_len=vid_seq_len, first_frame_is_clean=True)
+                vid_seq_len=vid_seq_len, ace_timestep=sigma, first_frame_is_clean=True)
 
         v_pos, a_pos = _fwd(txt_pos)
         if guidance != 1.0:
