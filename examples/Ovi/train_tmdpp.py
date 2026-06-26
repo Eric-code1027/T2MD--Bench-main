@@ -99,6 +99,9 @@ class TMDppTrainingModule(DiffusionTrainingModule):
         min_b = int(inputs.get("min_timestep_boundary", 0) * self.scheduler.num_train_timesteps)
         tid = torch.randint(min_b, max_b, (1,))
         timestep = self.scheduler.timesteps[tid].to(dtype=self.torch_dtype, device=self.device)
+        # ACE 时间步 == 同一噪声级的 sigma ∈ [0,1](见 fusion.forward 说明)
+        sigma = self.scheduler.get_sigma_from_timestep(timestep).to(
+            dtype=self.torch_dtype, device=self.device)
 
         noise_v = torch.randn_like(latent_video)
         noise_a = torch.randn_like(audio_latent)
@@ -126,6 +129,7 @@ class TMDppTrainingModule(DiffusionTrainingModule):
             ace_encoder_attention_mask=ace_enc_mask,
             ace_context_latents=ace_ctx,
             vid_seq_len=max_seq_len_video,
+            ace_timestep=sigma,
             first_frame_is_clean=True,
         )
 
