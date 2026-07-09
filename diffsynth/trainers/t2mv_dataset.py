@@ -1,4 +1,3 @@
-
 import os
 import sys
 
@@ -69,6 +68,7 @@ class AudioVideoDataset(torch.utils.data.Dataset):
                  video_fps=24,
                  audio_downsample_factor=512,
                  video_downsample_factor=4,
+                 ace_audio=False,              # ★ True => ACE 分支，48k 立体声
                 ):
         # 强制使用指定的数据集路径
         # self.csv_path = "./code/4s_pipeline/crawler_code/a_v_caption_filtered.jsonl"
@@ -79,6 +79,12 @@ class AudioVideoDataset(torch.utils.data.Dataset):
         self.repeat = repeat
         self.load_metadata(self.csv_path)
         self.dynamic_duration = dynamic_duration
+
+        # ★ ACE 分支覆盖音频参数：48kHz、立体声、ACE Oobleck 的 1920 samples/frame
+        self.ace_audio = ace_audio
+        if ace_audio:
+            audio_sample_rate = 48000
+            audio_downsample_factor = 1920    # 48000/1920 = 25Hz latent
 
         self.target_audio_length = target_audio_length
         self.target_video_frames = target_video_frames
@@ -125,24 +131,34 @@ class AudioVideoDataset(torch.utils.data.Dataset):
         print(f"[Dataset] Loaded {len(self.data)} samples.")
 
     def load_audio(self, audio_path):
-        """加载并处理音频"""
+        """加载并处理音频。
+        ace_audio=False: 原行为(mono, 16k, 返回 [L])。
+        ace_audio=True : 立体声, 48k, 返回 [2, L](供 ACE AutoencoderOobleck，全带宽保真)。
+        """
         try:
             # 加载音频
             if not os.path.exists(audio_path):
                 print(f"Audio file not found: {audio_path}")
-                return torch.zeros(self.actual_raw_audio_length)
+                return torch.zeros(2, self.actual_raw_audio_length) if self.ace_audio \
+                    else torch.zeros(self.actual_raw_audio_length)
 
-            waveform, orig_sr = torchaudio.load(audio_path)
-            
-            # 转换为单声道
-            if waveform.shape[0] > 1:
-                waveform = waveform.mean(dim=0, keepdim=True)
-            
-            # 重采样到16kHz
+            waveform, orig_sr = torchaudio.load(audio_path)   # [C, S]
+
+            if self.ace_audio:
+                # ★ 保留立体声：mono 复制成 2 通道；多通道取前 2 路
+                if waveform.shape[0] == 1:
+                    waveform = waveform.repeat(2, 1)
+                waveform = waveform[:2]
+            else:
+                # 原行为：下混单声道
+                if waveform.shape[0] > 1:
+                    waveform = waveform.mean(dim=0, keepdim=True)
+
+            # 重采样到目标采样率(ACE=48000, 原=16000)
             if orig_sr != self.audio_sample_rate:
                 resampler = torchaudio.transforms.Resample(orig_sr, self.audio_sample_rate)
                 waveform = resampler(waveform)
-            
+
             if self.dynamic_duration:
                 pass
             else:
@@ -154,11 +170,14 @@ class AudioVideoDataset(torch.utils.data.Dataset):
                     # 如果音频太短，进行填充
                     padding = self.actual_raw_audio_length - waveform.shape[1]
                     waveform = torch.nn.functional.pad(waveform, (0, padding))
-        
-            return waveform.squeeze(0)
+
+            if self.ace_audio:
+                return torch.clamp(waveform, -1.0, 1.0)       # [2, L]，保留通道维
+            return waveform.squeeze(0)                          # [L]，与原行为一致
         except Exception as e:
             print(f"Error loading audio {audio_path}: {e}")
-            return torch.zeros(self.actual_raw_audio_length) # Return correct length zeros
+            return torch.zeros(2, self.actual_raw_audio_length) if self.ace_audio \
+                else torch.zeros(self.actual_raw_audio_length) # Return correct length zeros
     
     def load_video(self, video_path):
         """加载并处理视频"""
