@@ -14,10 +14,34 @@ ACE-Step (v15 *base*) 加载与「逐层驱动」辅助工具。
 * `config_path` 用 base 权重目录(用户要求用 base,最全的一档)。
 * 这里所有函数都假定 batch_size == 1(与现有 train_t2av / 推理引擎一致)。
   扩 batch 时 mask / pad 逻辑需要再核对。
+
+★★★ 关键修复(音频真值处理) ★★★
+--------------------------------
+ACE 的 VAE 是 diffusers `AutoencoderOobleck`,**只接受 立体声(2 通道)、48kHz、[B,2,S]、
+幅度∈[-1,1]** 的波形(见 ACE handler 的 `_normalize_audio_to_stereo_48k`)。
+但上游 T2MD 数据管线(diffsynth/trainers/t2mv_dataset.py: load_audio)会把音频
+**下混成单声道并重采样到 16kHz**,返回 [1, L]。旧版 `encode_audio_to_latent` 把这个
+mono/16k 张量**直接**喂给 ACE VAE:
+    - 采样率不符(16k 当 48k 用)→ 时间轴/音高被 3× 扭曲;
+    - 通道数不符(mono 而非 stereo)。
+于是 VAE 编码出的 latent 解码回来是「被扭曲的音频」。这个错误是**确定且自洽**的:
+    原始音乐 → (mono/16k) VAE.encode → x0 → VAE.decode → 扭曲音频
+    模型对 x0 过拟合 → 拟合输出解码 ≈ 同一段扭曲音频
+=> 「真值解码 ≈ 拟合解码」(过拟合 sanity 通过),但两者都 ≠ 真实音乐。
+这正是「模型在学习一个有问题的真值」的现象。
+
+修复:在喂给 ACE VAE 之前,**统一整理成 stereo / 48kHz / [B,2,S] / clamp** 的输入
+(`prepare_audio_for_ace_vae`)。同时过拟合 sanity 用 `posterior.mode()`(确定性均值)
+而非 `.sample()`,避免每次编码往真值里注入新的 VAE 采样噪声,保证真值可复现。
 """
 import sys
 import torch
 import torch.nn as nn
+
+
+# ACE AutoencoderOobleck 的目标输入规格
+ACE_VAE_SAMPLE_RATE = 48000
+ACE_VAE_CHANNELS = 2
 
 
 # --------------------------------------------------------------------------- #
@@ -50,21 +74,88 @@ def init_acestep_handler(acestep_project_root: str,
 
 
 # --------------------------------------------------------------------------- #
+#  ★ 音频输入规范化(核心修复)
+# --------------------------------------------------------------------------- #
+def prepare_audio_for_ace_vae(audio: torch.Tensor,
+                              src_sample_rate: int,
+                              device,
+                              dtype: torch.dtype) -> torch.Tensor:
+    """把任意来源的波形整理成 ACE AutoencoderOobleck 期望的输入。
+
+    输出: [B, 2, S] 立体声、48kHz、幅度 clamp 到 [-1, 1]。
+
+    支持的输入形状:
+        [S]           单条 mono
+        [C, S]        单条(C 通道)
+        [B, S]        (dataset 里 `audio.unsqueeze(0)` 得到的 [1, L] 属于这种)
+        [B, C, S]     标准三维
+
+    注意 [B, S] 与 [C, S] 都是二维,靠启发式区分:第 0 维 <= 2 且第 1 维 > 2 时按 [C, S]
+    处理,否则按 [B, S](batch)处理。当前训练/推理均为 batch=1,两种解释结果一致。
+    """
+    x = audio
+    if x.dim() == 1:                                   # [S] -> [1, 1, S]
+        x = x.unsqueeze(0).unsqueeze(0)
+    elif x.dim() == 2:
+        if x.shape[0] <= ACE_VAE_CHANNELS and x.shape[1] > ACE_VAE_CHANNELS:
+            x = x.unsqueeze(0)                         # [C, S] -> [1, C, S]
+        else:
+            x = x.unsqueeze(1)                         # [B, S] -> [B, 1, S]
+    elif x.dim() == 3:                                 # [B, C, S]
+        pass
+    else:
+        raise ValueError(f"prepare_audio_for_ace_vae: 不支持的音频形状 {tuple(audio.shape)}")
+
+    x = x.to(device=device, dtype=torch.float32)
+
+    # 重采样到 48kHz(★ 修复采样率不符导致的时间轴/音高扭曲)
+    if src_sample_rate is not None and int(src_sample_rate) != ACE_VAE_SAMPLE_RATE:
+        import torchaudio
+        x = torchaudio.functional.resample(x, int(src_sample_rate), ACE_VAE_SAMPLE_RATE)
+
+    # mono -> stereo / 裁到 2 通道(★ 修复通道数不符)
+    C = x.shape[1]
+    if C == 1:
+        x = x.repeat(1, ACE_VAE_CHANNELS, 1)
+    elif C > ACE_VAE_CHANNELS:
+        x = x[:, :ACE_VAE_CHANNELS, :]
+
+    x = torch.clamp(x, -1.0, 1.0)
+    return x.to(dtype)
+
+
+# --------------------------------------------------------------------------- #
 #  VAE 编解码
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def encode_audio_to_latent(handler, audio: torch.Tensor) -> torch.Tensor:
-    """wav -> ACE latent。audio: [B, C, S] @48k  ->  [B, T, 64]"""
+def encode_audio_to_latent(handler,
+                           audio: torch.Tensor,
+                           src_sample_rate: int = ACE_VAE_SAMPLE_RATE,
+                           deterministic: bool = True) -> torch.Tensor:
+    """wav -> ACE latent。
+
+    Args:
+        audio: 任意形状的波形([S] / [C,S] / [B,S] / [B,C,S])。
+        src_sample_rate: 传入 audio 的真实采样率。**必须如实填写**,否则会被当成 48k
+            处理而扭曲。上游 T2MD 数据集默认 16000;若已把数据集改成 48k 立体声则填 48000。
+        deterministic: True 用后验均值 mode()(过拟合 sanity 的正确做法,真值可复现);
+            False 用 sample()(与 ACE 生成语义一致,真实大规模训练可用)。
+
+    Returns:
+        [B, T, 64] 的 ACE audio latent。
+    """
     vae = handler.vae
     device = next(vae.parameters()).device
-    audio = audio.to(device=device, dtype=vae.dtype)
-    latent = vae.encode(audio).latent_dist.sample()
-    return latent.transpose(1, 2).to(handler.dtype)            # [B, T, 64]
+    # ★ 关键修复:规范化到 stereo / 48k / [B,2,S] / clamp
+    audio = prepare_audio_for_ace_vae(audio, src_sample_rate, device, vae.dtype)   # [B, 2, S] @48k
+    posterior = vae.encode(audio).latent_dist
+    latent = posterior.mode() if deterministic else posterior.sample()             # [B, 64, T]
+    return latent.transpose(1, 2).to(handler.dtype)                                # [B, T, 64]
 
 
 @torch.no_grad()
 def decode_latent_to_audio(handler, latent: torch.Tensor) -> torch.Tensor:
-    """ACE latent -> wav。latent: [B, T, 64]  ->  [B, C, S] @48k"""
+    """ACE latent -> wav。latent: [B, T, 64]  ->  [B, 2, S] @48k(stereo)"""
     vae = handler.vae
     device = next(vae.parameters()).device
     x = latent.transpose(1, 2).to(device=device, dtype=vae.dtype)   # [B, 64, T]
