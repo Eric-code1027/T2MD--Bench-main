@@ -282,6 +282,7 @@ if __name__ == "__main__":
         csv_path=args.dataset_csv_path,
         dynamic_duration=args.dynamic_duration,
         repeat=args.dataset_repeat,
+        ace_audio=True,          # ★ TMD++ 用 48k 立体声原生加载
     )
 
     model = WanTrainingModule(
