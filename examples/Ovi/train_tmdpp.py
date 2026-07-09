@@ -50,7 +50,7 @@ accelerator = Accelerator()
 
 # 上游 T2MD 数据集 load_audio 返回的采样率(AudioVideoDataset 默认 16000)。
 # ★ 如实填写;若把数据集改成 48kHz 立体声原生加载,则改成 48000。
-AUDIO_SRC_SAMPLE_RATE = int(os.environ.get("TMDPP_AUDIO_SRC_SR", 16000))
+AUDIO_SRC_SAMPLE_RATE = int(os.environ.get("TMDPP_AUDIO_SRC_SR", 48000))
 
 
 class TMDppTrainingModule(DiffusionTrainingModule):
