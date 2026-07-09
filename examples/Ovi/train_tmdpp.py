@@ -14,6 +14,21 @@ TMD++ SFT 训练模块(Stage 4.2)
 用法:把本文件放到 examples/Ovi/,在 train_t2av.py 里把
    model = OviTrainingModule(...)  改为  model = TMDppTrainingModule(...)
 其余(WanTrainingModule / launch_training_task / dataloader)沿用原 train_t2av.py。
+
+★★★ 关键修复(音频真值处理) ★★★
+--------------------------------
+ACE VAE(AutoencoderOobleck)只接受 立体声 / 48kHz 的波形,而上游 T2MD 数据集
+(AudioVideoDataset.load_audio)把音频下混成 **单声道并重采样到 16kHz**(inputs["audio"]
+形状 [1, L])。旧版把 mono/16k 张量直接喂给 ACE VAE,导致编码出的「真值 latent」解码回来
+是被扭曲的音频 —— 模型确实过拟合了它,但它 ≠ 真实音乐(这就是「学习一个有问题的真值」)。
+
+修复:把数据集真实采样率 `AUDIO_SRC_SAMPLE_RATE` 如实传给 `encode_audio_to_latent`,
+由其内部统一重采样到 48kHz、复制成立体声、clamp 到 [-1,1](见 acestep_loader.py 的
+`prepare_audio_for_ace_vae`)。过拟合 sanity 用 deterministic=True(后验均值)保证真值可复现。
+
+★ 想要真正 99% 保真:请把数据集音频改成 **原生 48kHz 立体声** 加载
+(见 t2mv_dataset.py 的 load_audio 修改建议),然后把下面的 AUDIO_SRC_SAMPLE_RATE 改成 48000。
+若仍从 16kHz mono 上采样,时间轴/通道已正确,但高频信息在 16k 下采样时已丢失,保真上限受限。
 """
 import os
 import torch
@@ -33,6 +48,10 @@ from ovi.utils.model_loading_utils import (
 
 accelerator = Accelerator()
 
+# 上游 T2MD 数据集 load_audio 返回的采样率(AudioVideoDataset 默认 16000)。
+# ★ 如实填写;若把数据集改成 48kHz 立体声原生加载,则改成 48000。
+AUDIO_SRC_SAMPLE_RATE = int(os.environ.get("TMDPP_AUDIO_SRC_SR", 16000))
+
 
 class TMDppTrainingModule(DiffusionTrainingModule):
     def __init__(self, device="cuda", torch_dtype=torch.bfloat16, config=None,
@@ -42,6 +61,9 @@ class TMDppTrainingModule(DiffusionTrainingModule):
         self.torch_dtype = torch_dtype
         self.target_dtype = torch_dtype
         self.config = config
+        # 数据集音频采样率(供 ACE VAE 编码时重采样到 48k 用)
+        self.audio_src_sample_rate = (config.get("audio_src_sample_rate", AUDIO_SRC_SAMPLE_RATE)
+                                      if config else AUDIO_SRC_SAMPLE_RATE)
 
         # ---- video DiT 配置(沿用 ovi 的 video.json) ----
         import json
@@ -85,7 +107,13 @@ class TMDppTrainingModule(DiffusionTrainingModule):
         # latent_video: [B, C, F, H, W]  (B=1)
 
         # ---------- 音频 latent(ACE VAE) ----------
-        audio_latent = encode_audio_to_latent(self.handler, inputs["audio"]).to(self.torch_dtype)  # [1, T, 64]
+        # ★ 关键修复:如实告知源采样率,由 encode 内部统一到 stereo/48k;
+        #    过拟合 sanity 用 deterministic=True(后验均值,真值可复现)。
+        audio_latent = encode_audio_to_latent(
+            self.handler, inputs["audio"],
+            src_sample_rate=self.audio_src_sample_rate,
+            deterministic=True,
+        ).to(self.torch_dtype)  # [1, T, 64]
         Ta = audio_latent.shape[1]
         ace_enc, ace_enc_mask = build_ace_encoder_hidden(
             self.handler,
